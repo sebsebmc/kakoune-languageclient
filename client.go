@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"github.com/mafredri/cdp/rpcc"
+	"github.com/sebsebmc/kakoune-languageclient/langsrvr"
 	"io"
 	"io/ioutil"
 	"os"
@@ -15,10 +15,6 @@ import (
 
 type kakInstance struct {
 	session, client, pipe string
-}
-
-type languageServer struct {
-	server *rpcc.Conn
 }
 
 func main() {
@@ -36,7 +32,10 @@ func main() {
 
 	//Create pipe first, then let Kakoune know about it
 	instance.execCommand(fmt.Sprintf("decl str lsc_pipe %s", namedPipe))
-	//pr, _ := io.Pipe()
+
+	lspRPC := langsrvr.NewLangSrvr("/home/seb/go/bin/go-langserver")
+	lspRPC.Initialize()
+
 	reader := bufio.NewReader(fifo)
 	for {
 		line, _, err := reader.ReadLine()
@@ -55,7 +54,7 @@ func (inst *kakInstance) execCommand(command string) {
 	if err != nil {
 		fmt.Println("Failed to get the stdin pipe!")
 	}
-	cmd.Stdout = os.Stdout
+	//cmd.Stdout = os.Stdout
 	//There is no Stdout for a -p
 	cmd.Start()
 	in.Write([]byte(fmt.Sprintf("eval -client %s %s", inst.client, command)))
