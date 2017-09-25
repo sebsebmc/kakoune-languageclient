@@ -1,0 +1,1 @@
+/home/seb/.config/kak/autoload/lsc.kak
