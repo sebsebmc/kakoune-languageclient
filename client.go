@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"github.com/sebsebmc/kakoune-languageclient/langsrvr"
 	"io"
@@ -10,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -33,8 +33,7 @@ func main() {
 	//Create pipe first, then let Kakoune know about it
 	instance.execCommand(fmt.Sprintf("decl str lsc_pipe %s", namedPipe))
 
-	lspRPC := langsrvr.NewLangSrvr("/home/seb/go/bin/go-langserver")
-	lspRPC.Initialize()
+	servers := make(map[string]*langsrvr.LangSrvr)
 
 	reader := bufio.NewReader(fifo)
 	for {
@@ -42,10 +41,35 @@ func main() {
 		if err == io.EOF {
 			break
 		}
-		if bytes.Compare(line, []byte("Ping")) == 0 {
+		switch string(line) {
+		case "Ping":
 			instance.execCommand("echo -debug Pong\n")
+		case "KakEnd":
+			//TODO: shutdown servers
+			//TODO: Try and make this a child of kak
+			os.Exit(0)
+		default:
+			lang, cmd, args := tryParseCommand(string(line))
+			instance.execCommand(fmt.Sprintf("echo -debug \"%s %s %s\"", lang, cmd, args))
+			if server, ok := servers[lang]; ok {
+				server.Handle(cmd, args)
+			} else { //Spawn a langserver for the language
+				langRPC := langsrvr.NewLangSrvr("go-langserver")
+				servers[lang] = langRPC
+				langRPC.Initialize()
+				langRPC.Handle(cmd, args)
+			}
 		}
 	}
+}
+
+func tryParseCommand(command string) (string, string, []string) {
+	tokens := strings.Split(command, ":")
+	if len(tokens) < 3 {
+		return "", "", tokens
+	}
+	opts := strings.Split(tokens[2], ",")
+	return tokens[0], tokens[1], opts
 }
 
 func (inst *kakInstance) execCommand(command string) {
