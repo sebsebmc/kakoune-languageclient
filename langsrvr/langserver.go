@@ -3,6 +3,7 @@ package langsrvr
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"github.com/powerman/rpc-codec/jsonrpc2"
 	"io"
@@ -12,14 +13,14 @@ import (
 	"strconv"
 )
 
-type position struct {
-	line      int
-	character int
+type Position struct {
+	Line      int
+	Character int
 }
 
 type textRange struct {
-	start position
-	end   position
+	Start Position
+	End   Position
 }
 
 type ioReadWriteCloser struct {
@@ -35,6 +36,7 @@ func (rw ioReadWriteCloser) Close() error {
 	}
 	return err
 }
+
 func (rw ioReadWriteCloser) Write(buf []byte) (int, error) {
 	fmt.Printf("--> %s\n", string(buf))
 	contentLength := len(buf)
@@ -53,13 +55,13 @@ func (rw ioReadWriteCloser) Read(p []byte) (int, error) {
 		next, _ = headerReader.Peek(1)
 	}
 	n, err := headerReader.Read(p)
-	//fmt.Printf("<-- %s\n", string(p))
+	fmt.Printf("<-- %s\n", string(p))
 	return n, err
 }
 
 type LangSrvr struct {
 	conn     *jsonrpc2.Client
-	handlers map[string]func([]string)
+	handlers map[string]func([]string) string
 }
 
 func NewLangSrvr(command string) *LangSrvr {
@@ -80,7 +82,7 @@ func NewLangSrvr(command string) *LangSrvr {
 		fmt.Printf("%s\n", err)
 	}
 	var lspRPC LangSrvr
-	lspRPC.handlers = make(map[string]func([]string))
+	lspRPC.handlers = make(map[string](func([]string) string))
 	lspRPC.conn = jsonrpc2.NewClient(serverConn)
 	return &lspRPC
 }
@@ -93,29 +95,31 @@ func (ls *LangSrvr) Initialize() {
 	//TODO: use capabilities to assign handlers
 	ls.handlers["textDocument/hover"] = ls.tdHover
 	ls.handlers["textDocument/signatureHelp"] = ls.tdSigHelp
-	ls.execCommandSync("initialize", params)
+	ls.execCommandSync("initialize", params, nil)
 	ls.notify("initialized", nil)
 }
 
-func (ls *LangSrvr) Handle(cmd string, args []string) {
+func (ls *LangSrvr) Handle(cmd string, args []string) (string, error) {
 	handler, ok := ls.handlers[cmd]
 	if ok == false {
-		return
+		return "", errors.New("Command does not exist")
 	}
-	handler(args)
+	return handler(args), nil
 }
 
 func (ls *LangSrvr) Shutdown() {
-	ls.execCommandSync("shutdown", map[string]interface{}{})
+	ls.execCommandSync("shutdown", map[string]interface{}{}, nil)
 }
+
+//=======================================================
 
 /*
 * buffile, line, charachter
 * textDocument/hover
 * params:{textDocument:URI, position:{line:,character:}}
  */
-func (ls *LangSrvr) tdHover(params []string) {
-    fmt.Printf("hover: %s\n", params)
+func (ls *LangSrvr) tdHover(params []string) string {
+	fmt.Printf("hover: %s\n", params)
 	uri := "file://" + params[0]
 	line, _ := strconv.Atoi(params[1])
 	character, _ := strconv.Atoi(params[2])
@@ -126,15 +130,26 @@ func (ls *LangSrvr) tdHover(params []string) {
 			"character": character - 1,
 		},
 	}
-	ls.execCommandSync("textDocument/hover", paramMap)
+	type MarkedString struct {
+		Language string `json:"language,omitempty"`
+		Value    string `json:"value,omitempty"`
+		Simple   string `json:"simple,omitempty"`
+	}
+	reply := struct {
+		Docs   []MarkedString `json:"contents"`
+		Ranges textRange      `json:"range,omitempty"`
+	}{}
+	ls.execCommandSync("textDocument/hover", paramMap, &reply)
+	fmt.Println(reply)
+	return fmt.Sprintf("info -placement above -anchor %s.%s '%s'", params[1], params[2], reply.Docs[0])
 }
 
 /*
 * textDocument/signatureHelp
 * params:{textDocument:URI, position:{line:,character:}}
  */
-func (ls *LangSrvr) tdSigHelp(params []string) {
-    fmt.Printf("sigHelp: %s\n", params)
+func (ls *LangSrvr) tdSigHelp(params []string) string {
+	fmt.Printf("sigHelp: %s\n", params)
 	uri := "file://" + params[0]
 	line, _ := strconv.Atoi(params[1])
 	character, _ := strconv.Atoi(params[2])
@@ -145,20 +160,35 @@ func (ls *LangSrvr) tdSigHelp(params []string) {
 			"character": character - 1,
 		},
 	}
-	ls.execCommandSync("textDocument/signatureHelp", paramMap)
+	type sigInfo struct {
+		Label  string                   `json:"label"`
+		Docs   string                   `json:"documentation,omitempty"`
+		Params []map[string]interface{} `json:"parameters,omitempty"`
+	}
+	reply := struct {
+		Signatures []sigInfo `json:"signatures"`
+		AParam     int       `json:"activeParameter,omitempty"`
+		ASig       int       `json:"activeSignature,omitempty"`
+	}{}
+	err := ls.execCommandSync("textDocument/signatureHelp", paramMap, &reply)
+	if err != nil {
+		return "echo 'Command failed'"
+	}
+	fmt.Println(reply)
+	return fmt.Sprintf("info -placement above -anchor %s.%s '%s\n%s'", params[1], params[2], reply.Signatures[reply.ASig].Label, reply.Signatures[reply.ASig].Docs)
 }
 
-func (ls *LangSrvr) execCommandSync(command string, params map[string]interface{}) map[string]interface{} {
-	var reply map[string]interface{}
-	err := ls.conn.Call(command, params, &reply)
+func (ls *LangSrvr) execCommandSync(command string, params map[string]interface{}, reply interface{}) error {
+	err := ls.conn.Call(command, params, reply)
 	if err == rpc.ErrShutdown || err == io.ErrUnexpectedEOF {
 		fmt.Printf("Err1(): %q\n", err)
+		return errors.New("RPC Error")
 	} else if err != nil {
 		rpcerr := jsonrpc2.ServerError(err)
 		fmt.Printf("Err1(): code=%d msg=%q data=%v\n", rpcerr.Code, rpcerr.Message, rpcerr.Data)
+		return errors.New("JSONRPC Error")
 	}
-	fmt.Println(reply)
-	return reply
+	return nil
 }
 
 func (ls *LangSrvr) notify(method string, args interface{}) {

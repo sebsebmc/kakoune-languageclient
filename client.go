@@ -24,6 +24,7 @@ func main() {
 
 	namedPipe := filepath.Join(tmpDir, session)
 	syscall.Mkfifo(namedPipe, 0600)
+	defer os.RemoveAll(namedPipe)
 
 	instance := kakInstance{session, client, namedPipe}
 
@@ -46,18 +47,23 @@ func main() {
 			instance.execCommand("echo -debug Pong\n")
 		case "KakEnd":
 			//TODO: shutdown servers
-			//TODO: Try and make this a child of kak
+			//TODO: Try and make this a child of kak? Closing kak seems to close the spawned servers now...
 			os.Exit(0)
 		default:
 			lang, cmd, args := tryParseCommand(string(line))
 			instance.execCommand(fmt.Sprintf("echo -debug \"%s %s %s\"", lang, cmd, args))
-			if server, ok := servers[lang]; ok {
-				server.Handle(cmd, args)
-			} else { //Spawn a langserver for the language
-				langRPC := langsrvr.NewLangSrvr("go-langserver")
-				servers[lang] = langRPC
-				langRPC.Initialize()
-				langRPC.Handle(cmd, args)
+			server, ok := servers[lang]
+			if !ok {
+				//Spawn a langserver for the language
+				//TODO:
+				server = langsrvr.NewLangSrvr("go-langserver")
+				servers[lang] = server
+				server.Initialize()
+			}
+			kakCmd, err := server.Handle(cmd, args)
+			fmt.Println(kakCmd)
+			if err == nil {
+				instance.execCommand(kakCmd)
 			}
 		}
 	}
@@ -81,7 +87,7 @@ func (inst *kakInstance) execCommand(command string) {
 	//cmd.Stdout = os.Stdout
 	//There is no Stdout for a -p
 	cmd.Start()
-	in.Write([]byte(fmt.Sprintf("eval -client %s %s", inst.client, command)))
+	in.Write([]byte(fmt.Sprintf("eval -client %s \"%s\"", inst.client, command)))
 	in.Close()
 	cmd.Wait()
 }
