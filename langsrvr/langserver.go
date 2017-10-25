@@ -3,6 +3,7 @@ package langsrvr
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/powerman/rpc-codec/jsonrpc2"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 )
 
 type Position struct {
@@ -26,6 +28,29 @@ type textRange struct {
 type ioReadWriteCloser struct {
 	io.ReadCloser
 	io.WriteCloser
+}
+
+type MarkedString markedString
+
+type markedString struct {
+	Language string `json:"language,omitempty"`
+	Value    string `json:"value,omitempty"`
+	Simple   string `json:"simple,omitempty"`
+}
+
+func (m *MarkedString) UnmarshalJSON(data []byte) error {
+	if d := strings.TrimSpace(string(data)); len(d) > 0 && d[0] == '"' {
+		// Raw string
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		m.Value = s
+		return nil
+	}
+	// Language string
+	ms := (*markedString)(m)
+	return json.Unmarshal(data, ms)
 }
 
 //From https://github.com/natefinch/pie
@@ -46,13 +71,17 @@ func (rw ioReadWriteCloser) Write(buf []byte) (int, error) {
 	return n, err
 }
 
+//Proxies reading in, so it may have to remove the header, which may or may not be present...
 func (rw ioReadWriteCloser) Read(p []byte) (int, error) {
 	headerReader := bufio.NewReader(rw.ReadCloser)
 	headerReader.ReadLine()
-	next, _ := headerReader.Peek(1)
+	next, err := headerReader.Peek(1)
 	for !bytes.Equal(next, []byte("{")) {
 		headerReader.ReadLine()
-		next, _ = headerReader.Peek(1)
+		next, err = headerReader.Peek(1)
+		if err != nil {
+    		break
+		}
 	}
 	n, err := headerReader.Read(p)
 	fmt.Printf("<-- %s\n", string(p))
@@ -130,18 +159,16 @@ func (ls *LangSrvr) tdHover(params []string) string {
 			"character": character - 1,
 		},
 	}
-	type MarkedString struct {
-		Language string `json:"language,omitempty"`
-		Value    string `json:"value,omitempty"`
-		Simple   string `json:"simple,omitempty"`
-	}
 	reply := struct {
 		Docs   []MarkedString `json:"contents"`
 		Ranges textRange      `json:"range,omitempty"`
 	}{}
-	ls.execCommandSync("textDocument/hover", paramMap, &reply)
+	err := ls.execCommandSync("textDocument/hover", paramMap, &reply)
+	if err != nil {
+		return "echo 'Command Failed'"
+	}
 	fmt.Println(reply)
-	return fmt.Sprintf("info -placement above -anchor %s.%s '%s'", params[1], params[2], reply.Docs[0])
+	return fmt.Sprintf("info -placement below -anchor %s.%s '%s'", params[1], params[2], reply.Docs[0].Value)
 }
 
 /*
