@@ -18,6 +18,10 @@ type kakInstance struct {
 }
 
 func main() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: kakoune-languageclient sessionId clientName")
+		os.Exit(1)
+	}
 	session := os.Args[1]
 	client := os.Args[2]
 	tmpDir, _ := ioutil.TempDir("", "kakoune-languageclient")
@@ -60,7 +64,7 @@ func main() {
 				servers[lang] = server
 				server.Initialize()
 			}
-			kakCmd, err := server.Handle(cmd, args)
+			kakCmd, err := server.HandleKak(cmd, args)
 			fmt.Println(kakCmd)
 			if err == nil {
 				instance.execCommand(kakCmd)

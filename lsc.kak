@@ -1,4 +1,4 @@
-echo -debug "Loading lsc.kakrc"
+echo -debug "Loading lsc.kak"
 
 hook global NormalKey 0 %{ nop %sh{
    (/mnt/e/GoWorkspace/bin/kakoune-languageclient $kak_session $kak_client) > /dev/null 2>&1 < /dev/null &

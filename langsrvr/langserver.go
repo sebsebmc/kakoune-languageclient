@@ -1,14 +1,12 @@
 package langsrvr
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/powerman/rpc-codec/jsonrpc2"
+	"github.com/sourcegraph/jsonrpc2"
 	"io"
-	"net/rpc"
 	"os"
 	"os/exec"
 	"strconv"
@@ -64,32 +62,18 @@ func (rw ioReadWriteCloser) Close() error {
 
 func (rw ioReadWriteCloser) Write(buf []byte) (int, error) {
 	fmt.Printf("--> %s\n", string(buf))
-	contentLength := len(buf)
-	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", contentLength)
-	rw.WriteCloser.Write([]byte(header))
-	n, err := rw.WriteCloser.Write(buf)
-	return n, err
+	return rw.WriteCloser.Write(buf)
 }
 
 //Proxies reading in, so it may have to remove the header, which may or may not be present...
 func (rw ioReadWriteCloser) Read(p []byte) (int, error) {
-	headerReader := bufio.NewReader(rw.ReadCloser)
-	headerReader.ReadLine()
-	next, err := headerReader.Peek(1)
-	for !bytes.Equal(next, []byte("{")) {
-		headerReader.ReadLine()
-		next, err = headerReader.Peek(1)
-		if err != nil {
-    		break
-		}
-	}
-	n, err := headerReader.Read(p)
+	n, err := rw.ReadCloser.Read(p)
 	fmt.Printf("<-- %s\n", string(p))
 	return n, err
 }
 
 type LangSrvr struct {
-	conn     *jsonrpc2.Client
+	conn     *jsonrpc2.Conn
 	handlers map[string]func([]string) string
 }
 
@@ -112,7 +96,8 @@ func NewLangSrvr(command string) *LangSrvr {
 	}
 	var lspRPC LangSrvr
 	lspRPC.handlers = make(map[string](func([]string) string))
-	lspRPC.conn = jsonrpc2.NewClient(serverConn)
+	lspRPC.conn = jsonrpc2.NewConn(context.Background(), jsonrpc2.NewBufferedStream(serverConn, jsonrpc2.VSCodeObjectCodec{}),
+		lspRPC)
 	return &lspRPC
 }
 
@@ -128,7 +113,7 @@ func (ls *LangSrvr) Initialize() {
 	ls.notify("initialized", nil)
 }
 
-func (ls *LangSrvr) Handle(cmd string, args []string) (string, error) {
+func (ls LangSrvr) HandleKak(cmd string, args []string) (string, error) {
 	handler, ok := ls.handlers[cmd]
 	if ok == false {
 		return "", errors.New("Command does not exist")
@@ -136,7 +121,11 @@ func (ls *LangSrvr) Handle(cmd string, args []string) (string, error) {
 	return handler(args), nil
 }
 
-func (ls *LangSrvr) Shutdown() {
+func (ls LangSrvr) Handle(c context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
+
+}
+
+func (ls LangSrvr) Shutdown() {
 	ls.execCommandSync("shutdown", map[string]interface{}{}, nil)
 }
 
@@ -173,9 +162,9 @@ func (ls *LangSrvr) tdHover(params []string) string {
 
 /*
 * textDocument/signatureHelp
-* params:{textDocument:URI, position:{line:,character:}}
+* params:{textDocument:URI, position:{line:#,character:#}}
  */
-func (ls *LangSrvr) tdSigHelp(params []string) string {
+func (ls LangSrvr) tdSigHelp(params []string) string {
 	fmt.Printf("sigHelp: %s\n", params)
 	uri := "file://" + params[0]
 	line, _ := strconv.Atoi(params[1])
@@ -201,23 +190,29 @@ func (ls *LangSrvr) tdSigHelp(params []string) string {
 	if err != nil {
 		return "echo 'Command failed'"
 	}
+	if len(reply.Signatures) == 0 {
+		return "echo 'No signatures found'"
+	}
+	for i := 0; i < len(reply.Signatures); i++ {
+		s := reply.Signatures[i]
+		s.Docs = strings.Replace(s.Docs, "\\'", "\\\\'", -1)
+		s.Docs = strings.Replace(s.Docs, "'", "\\'", -1)
+		s.Docs = strings.Replace(s.Docs, "\"", "\\\"", -1)
+		reply.Signatures[i] = s
+	}
 	fmt.Println(reply)
-	return fmt.Sprintf("info -placement above -anchor %s.%s '%s\n%s'", params[1], params[2], reply.Signatures[reply.ASig].Label, reply.Signatures[reply.ASig].Docs)
+	return fmt.Sprintf("info -placement below -anchor %s.%s '%s\n%s'", params[1], params[2], reply.Signatures[reply.ASig].Label, reply.Signatures[reply.ASig].Docs)
 }
 
-func (ls *LangSrvr) execCommandSync(command string, params map[string]interface{}, reply interface{}) error {
-	err := ls.conn.Call(command, params, reply)
-	if err == rpc.ErrShutdown || err == io.ErrUnexpectedEOF {
+func (ls LangSrvr) execCommandSync(command string, params map[string]interface{}, reply interface{}) error {
+	err := ls.conn.Call(context.Background(), command, params, reply)
+	if err != nil {
 		fmt.Printf("Err1(): %q\n", err)
 		return errors.New("RPC Error")
-	} else if err != nil {
-		rpcerr := jsonrpc2.ServerError(err)
-		fmt.Printf("Err1(): code=%d msg=%q data=%v\n", rpcerr.Code, rpcerr.Message, rpcerr.Data)
-		return errors.New("JSONRPC Error")
 	}
 	return nil
 }
 
-func (ls *LangSrvr) notify(method string, args interface{}) {
-	ls.conn.Notify(method, args)
+func (ls LangSrvr) notify(method string, args interface{}) {
+	ls.conn.Notify(context.Background(), method, args)
 }
