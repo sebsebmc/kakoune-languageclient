@@ -1,4 +1,4 @@
-package langsrvr
+package main
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/sourcegraph/jsonrpc2"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"strconv"
@@ -74,7 +75,7 @@ func (rw ioReadWriteCloser) Read(p []byte) (int, error) {
 
 type LangSrvr struct {
 	conn     *jsonrpc2.Conn
-	handlers map[string]func([]string) string
+	handlers map[string]func(*kakBuffer, []string) string
 }
 
 func NewLangSrvr(command string) *LangSrvr {
@@ -95,7 +96,7 @@ func NewLangSrvr(command string) *LangSrvr {
 		fmt.Printf("%s\n", err)
 	}
 	var lspRPC LangSrvr
-	lspRPC.handlers = make(map[string](func([]string) string))
+	lspRPC.handlers = make(map[string](func(*kakBuffer, []string) string))
 	lspRPC.conn = jsonrpc2.NewConn(context.Background(), jsonrpc2.NewBufferedStream(serverConn, jsonrpc2.VSCodeObjectCodec{}),
 		lspRPC)
 	return &lspRPC
@@ -107,20 +108,22 @@ func (ls *LangSrvr) Initialize() {
 	params := map[string]interface{}{"processId": os.Getpid(), "rootUri": fileUri, "rootPath": wd,
 		"capabilities": make(map[string]interface{})}
 	//TODO: use capabilities to assign handlers
+	ls.handlers["textDocument/sync"] = ls.tdSync
 	ls.handlers["textDocument/hover"] = ls.tdHover
 	ls.handlers["textDocument/signatureHelp"] = ls.tdSigHelp
 	ls.execCommandSync("initialize", params, nil)
 	ls.notify("initialized", nil)
 }
 
-func (ls LangSrvr) HandleKak(cmd string, args []string) (string, error) {
-	handler, ok := ls.handlers[cmd]
+func (ls LangSrvr) HandleKak(buf *kakBuffer, cmd *lspCommand) (string, error) {
+	handler, ok := ls.handlers[cmd.command]
 	if ok == false {
 		return "", errors.New("Command does not exist")
 	}
-	return handler(args), nil
+	return handler(buf, cmd.args), nil
 }
 
+// This function receives messages from the LS
 func (ls LangSrvr) Handle(c context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
 
 }
@@ -129,18 +132,63 @@ func (ls LangSrvr) Shutdown() {
 	ls.execCommandSync("shutdown", map[string]interface{}{}, nil)
 }
 
-//=======================================================
+func (ls LangSrvr) execCommandSync(command string, params map[string]interface{}, reply interface{}) error {
+	err := ls.conn.Call(context.Background(), command, params, reply)
+	if err != nil {
+		fmt.Printf("Err1(): %q\n", err)
+		return errors.New("RPC Error")
+	}
+	return nil
+}
 
-/*
-* buffile, line, charachter
-* textDocument/hover
-* params:{textDocument:URI, position:{line:,character:}}
- */
-func (ls *LangSrvr) tdHover(params []string) string {
+func (ls LangSrvr) notify(method string, args interface{}) {
+	ls.conn.Notify(context.Background(), method, args)
+}
+
+//=============== Handlers =================================
+
+// Provides syncing interface, however we can only sync the whole file because
+// Kakoune doesn't provide the changes since last save. The current method
+// involves telling Kakoune to write the buffer to a temp file and copying
+// the contents of the temp file. Eww...
+func (ls *LangSrvr) tdSync(buf *kakBuffer, params []string) string {
+	contents, err := ioutil.ReadAll(buf.tmpFile)
+	if err != nil {
+    	fmt.Println("Failed to read temp file for syncing")
+	}
+	if buf.lastSync == 0 {
+		ls.notify("textDocument/didOpen", map[string]interface{}{
+			"textDocument": map[string]interface{}{
+				"uri":      buf.file,
+				"version":  buf.lastEdit,
+				"language": buf.language,
+				"text":     contents,
+			},
+		})
+	} else {
+		ls.notify("textDocument/didChange", map[string]interface{}{
+			"textDocument": map[string]interface{}{
+				"uri":     buf.file,
+				"version": buf.lastEdit,
+			},
+			"contentChanges": []map[string]interface{}{
+				0: {"text": contents},
+			},
+		})
+	}
+	buf.lastSync = buf.lastEdit
+	return "nop" //Oh look, a use for nop
+}
+
+// textDocument/hover requires syncing
+// buffile, line, charachter
+// textDocument/hover
+// params:{textDocument:URI, position:{line:,character:}}
+func (ls *LangSrvr) tdHover(buf *kakBuffer, params []string) string {
 	fmt.Printf("hover: %s\n", params)
-	uri := "file://" + params[0]
-	line, _ := strconv.Atoi(params[1])
-	character, _ := strconv.Atoi(params[2])
+	uri := "file://" + buf.file
+	line, _ := strconv.Atoi(params[0])
+	character, _ := strconv.Atoi(params[1])
 	paramMap := map[string]interface{}{
 		"textDocument": map[string]string{"uri": uri},
 		"position": map[string]interface{}{
@@ -157,18 +205,17 @@ func (ls *LangSrvr) tdHover(params []string) string {
 		return "echo 'Command Failed'"
 	}
 	fmt.Println(reply)
-	return fmt.Sprintf("info -placement below -anchor %s.%s '%s'", params[1], params[2], reply.Docs[0].Value)
+	return fmt.Sprintf("info -placement below -anchor %s.%s '%s'", params[0], params[1], reply.Docs[0].Value)
 }
 
-/*
-* textDocument/signatureHelp
-* params:{textDocument:URI, position:{line:#,character:#}}
- */
-func (ls LangSrvr) tdSigHelp(params []string) string {
+// textDocument/signatureHelp requires syncing
+// params:{textDocument:URI, position:{line:#,character:#}}
+func (ls LangSrvr) tdSigHelp(buf *kakBuffer, params []string) string {
 	fmt.Printf("sigHelp: %s\n", params)
-	uri := "file://" + params[0]
-	line, _ := strconv.Atoi(params[1])
-	character, _ := strconv.Atoi(params[2])
+
+	uri := "file://" + buf.file 
+	line, _ := strconv.Atoi(params[0])
+	character, _ := strconv.Atoi(params[1])
 	paramMap := map[string]interface{}{
 		"textDocument": map[string]string{"uri": uri},
 		"position": map[string]interface{}{
@@ -201,18 +248,5 @@ func (ls LangSrvr) tdSigHelp(params []string) string {
 		reply.Signatures[i] = s
 	}
 	fmt.Println(reply)
-	return fmt.Sprintf("info -placement below -anchor %s.%s '%s\n%s'", params[1], params[2], reply.Signatures[reply.ASig].Label, reply.Signatures[reply.ASig].Docs)
-}
-
-func (ls LangSrvr) execCommandSync(command string, params map[string]interface{}, reply interface{}) error {
-	err := ls.conn.Call(context.Background(), command, params, reply)
-	if err != nil {
-		fmt.Printf("Err1(): %q\n", err)
-		return errors.New("RPC Error")
-	}
-	return nil
-}
-
-func (ls LangSrvr) notify(method string, args interface{}) {
-	ls.conn.Notify(context.Background(), method, args)
+	return fmt.Sprintf("info -placement below -anchor %s.%s '%s\n%s'", params[0], params[1], reply.Signatures[reply.ASig].Label, reply.Signatures[reply.ASig].Docs)
 }
